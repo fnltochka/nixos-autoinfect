@@ -1,0 +1,73 @@
+name: Test nixos-autoinfect
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run ShellCheck
+        run: shellcheck nixos-autoinfect
+
+  dryrun-matrix:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-18.04
+          - ubuntu-20.04
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - debian:stretch
+          - debian:buster
+          - debian:bullseye
+          - debian:bookworm
+          - debian:trixie
+          - fedora:36
+          - fedora:37
+          - fedora:38
+          - fedora:39
+          - fedora:40
+          - alpine:3.15
+          - alpine:3.16
+          - alpine:3.17
+          - alpine:3.18
+          - alpine:3.19
+          - alpine:3.20
+          - archlinux:latest
+          - centos:7
+          - centos:8
+          - rockylinux:8
+          - rockylinux:9
+          - oraclelinux:7
+          - oraclelinux:8
+          - oraclelinux:9
+          - opensuse/leap:15.4
+          - opensuse/leap:15.5
+          - opensuse/tumbleweed
+        provider:
+          - aws
+          - azure
+          - gce
+          - openstack
+          - docker
+          - lxc
+          - qemu
+          - vmware
+          - virtualbox
+          - xen
+          - generic
+    container:
+      image: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make script executable
+        run: chmod +x nixos-autoinfect
+      - name: Dry-run with provider ${{ matrix.provider }}
+        run: sudo ./nixos-autoinfect --dry-run --test-provider=${{ matrix.provider }}

@@ -104,18 +104,17 @@ autodetectProvider() {
 getNixOSModulePath() {
   local provider_name="$1"
   case "$provider_name" in
-  "aws") echo "virtualisation/amazon-image.nix" ;;
-  "azure") echo "virtualisation/azure-image.nix" ;;
-  "gce") echo "virtualisation/gce-image.nix" ;;
-  "openstack") echo "virtualisation/openstack.nix" ;;
-  "docker") echo "virtualisation/docker.nix" ;;
-  "lxc") echo "virtualisation/lxc-container.nix" ;;
-  "qemu") echo "virtualisation/qemu-guest.nix" ;;
-  "vmware") echo "virtualisation/vmware-guest.nix" ;;
-  "virtualbox") echo "virtualisation/virtualbox-guest.nix" ;;
-  "xen") echo "virtualisation/xen-domu.nix" ;;
+  "aws") echo "(modulesPath + \"/virtualisation/amazon-image.nix\")" ;;
+  "azure") echo "(modulesPath + \"/virtualisation/azure-image.nix\")" ;;
+  "gce") echo "(modulesPath + \"/virtualisation/google-compute-image.nix\")" ;;
+  "openstack") echo "(modulesPath + \"/virtualisation/openstack-config.nix\")" ;;
+  "docker") echo "(modulesPath + \"/virtualisation/docker.nix\")" ;;
+  "lxc") echo "(modulesPath + \"/virtualisation/lxc-container.nix\")" ;;
+  "qemu") echo "(modulesPath + \"/profiles/qemu-guest.nix\")" ;;
+  "vmware") echo "(modulesPath + \"/virtualisation/vmware-guest.nix\")" ;;
+  "virtualbox") echo "(modulesPath + \"/virtualisation/virtualbox-guest.nix\")" ;;
+  "xen") echo "(modulesPath + \"/virtualisation/xen-domu.nix\")" ;;
   *)
-    # No specific module for generic, or specific modules handled by other logic
     echo ""
     ;;
   esac
@@ -133,8 +132,7 @@ generateCommonConfig() {
 
   local imports_block=""
   if [[ -n "$module_import_path" ]]; then
-    # shellcheck disable=SC2154
-    imports_block="${modulesPath}/${module_import_path}"
+    imports_block="$module_import_path"
   fi
 
   local networking_import_line=""
@@ -142,8 +140,13 @@ generateCommonConfig() {
     networking_import_line="./networking.nix # generated at runtime by nixos-infect"
   fi
 
+  local qemu_guest_agent=""
+  if [[ "$imports_block" == *qemu-guest.nix* ]]; then
+    qemu_guest_agent="services.qemuGuest.enable = true;"
+  fi
+
   cat >/etc/nixos/configuration.nix <<EOF
-{ ... }: {
+{ config, pkgs, modulesPath, ... }: {
   imports = [
     ./hardware-configuration.nix
     ${networking_import_line}
@@ -175,6 +178,7 @@ generateCommonConfig() {
   # Set system.stateVersion to 25.05
   system.stateVersion = "25.05";
 
+  ${qemu_guest_agent}
   ${additional_config_content}
 }
 EOF
@@ -229,11 +233,11 @@ makeConf() {
     do_networking_conf=true
     ;;
   "gce")
-    module_file_path="virtualisation/gce-image.nix"
+    module_file_path="virtualisation/google-compute-image.nix"
     do_networking_conf=true
     ;;
   "openstack")
-    module_file_path="virtualisation/openstack.nix"
+    module_file_path="virtualisation/openstack-config.nix"
     do_networking_conf=true
     ;;
   "docker")
@@ -263,7 +267,7 @@ EOD
     do_networking_conf=false # Network is managed by the host
     ;;
   "qemu")
-    module_file_path="virtualisation/qemu-guest.nix"
+    module_file_path="(modulesPath + \"/profiles/qemu-guest.nix\")"
     do_networking_conf=true
     ;;
   "vmware")
@@ -322,7 +326,16 @@ EOD
     rootPassword=$(openssl rand -base64 12)
     passHash=$(openssl passwd -6 "$rootPassword")
   else
-    log_warning "openssl not found, root password will not be set."
+    log_warning "openssl not found, root password will not be set. Attempting to install openssl..."
+    install_package "openssl" || {
+      log_error "Failed to install openssl. Root password will not be set."
+      log_info "Please ensure SSH keys are set up for root access or manually set a password after installation."
+    }
+    if command -v openssl >/dev/null 2>&1; then
+      rootPassword=$(openssl rand -base64 12)
+      passHash=$(openssl passwd -6 "$rootPassword")
+      log_info "openssl installed successfully, root password generated."
+    fi
   fi
 
   # Generate configuration.nix
@@ -546,11 +559,17 @@ get_default_gateway() {
 makeNetworkingConf() {
   local IFS=$'\n'
   local eth0_name
-  eth0_name=$(ip address show | grep '^2:' | awk -F': ' '{print $2}')
+  # Try to find the primary network interface with an IP address
+  eth0_name=$(ip -4 address show | grep inet | grep -v 127.0.0.1 | head -n 1 | awk -F': ' '{print $2}' | awk '{print $1}')
   if [ -z "$eth0_name" ]; then
-    log_warning "No primary network interface found, networking configuration may be incomplete."
+    log_warning "No primary network interface with an IP address found, trying default interface."
+    eth0_name=$(ip address show | grep '^2:' | awk -F': ' '{print $2}')
+  fi
+  if [ -z "$eth0_name" ]; then
+    log_error "No network interface found, networking configuration will be skipped."
     return 1
   fi
+  log_info "Using $eth0_name as primary network interface."
   local eth0_ip4s=$(get_interface_address_info "$eth0_name" "4")
   local eth0_ip6s=$(get_interface_address_info "$eth0_name" "6")
   local gateway=$(get_default_gateway "$eth0_name" "4")
@@ -566,16 +585,17 @@ makeNetworkingConf() {
 
   eth1_name=$(ip address show | grep '^3:' | awk -F': ' '{print $2}') || true
   if [ -n "$eth1_name" ]; then
+    log_info "Found secondary network interface: $eth1_name"
     eth1_ip4s=$(get_interface_address_info "$eth1_name" "4")
     eth1_ip6s=$(get_interface_address_info "$eth1_name" "6")
     ether1=$(get_interface_mac_address "$eth1_name")
     interfaces1=$(
       cat <<EOF
       $eth1_name = {
-        ipv4.addresses = [$(for a in "${eth1_ip4s[@]}"; do echo -n "
+        ipv4.addresses = [$(echo "$eth1_ip4s" | while IFS= read -r a; do echo -n "
           $a"; done)
         ];
-        ipv6.addresses = [$(for a in "${eth1_ip6s[@]}"; do echo -n "
+        ipv6.addresses = [$(echo "$eth1_ip6s" | while IFS= read -r a; do echo -n "
           $a"; done)
         ];
       };
@@ -586,10 +606,20 @@ EOF
 
   local nameservers=()
   if [ -f /etc/resolv.conf ]; then
-    mapfile -t nameservers < <(grep ^nameserver /etc/resolv.conf | sed -r \
-      -e 's/^nameserver[[:space:]]+([0-9.a-fA-F:]+).*/"\1"/' \
-      -e 's/127[0-9.]+/8.8.8.8/' \
-      -e 's/::1/8.8.8.8/')
+    while IFS= read -r line; do
+      # Remove comments and empty lines
+      line=$(echo "$line" | sed 's/#.*$//g' | xargs)
+      [[ -z "$line" ]] && continue
+
+      if [[ "$line" =~ ^nameserver[[:space:]]+([0-9.a-fA-F:]+)$ ]]; then
+        local ip="${BASH_REMATCH[1]}"
+        # Replace local loopback with public DNS
+        if [[ "$ip" =~ ^127\. || "$ip" == "::1" ]]; then
+          ip="8.8.8.8"
+        fi
+        nameservers+=("\"$ip\"")
+      fi
+    done </etc/resolv.conf
   else
     log_warning "/etc/resolv.conf not found, using default nameservers."
     nameservers=("8.8.8.8" "8.8.4.4")
@@ -606,24 +636,17 @@ EOF
 { lib, ... }: {
   # Generated by nixos-infect
   networking = {
-    nameservers = [ ${nameservers[@]} ];
-    defaultGateway = "${gateway:-}";
-    defaultGateway6 = {
-      address = "${gateway6:-}";
-      interface = "${eth0_name}";
-    };
+    nameservers = [ ${nameservers[*]} ];
+    $([[ -n "$gateway" ]] && echo "defaultGateway = \"$gateway\";")
+    $([[ -n "$gateway6" ]] && echo "defaultGateway6 = { address = \"$gateway6\"; interface = \"$eth0_name\"; };")
     dhcpcd.enable = false;
     $use_predictable_names_config
     interfaces = {
       $eth0_name = {
-        ipv4.addresses = [$(for a in "${eth0_ip4s[@]}"; do echo -n "
-          $a"; done)
-        ];
-        ipv6.addresses = [$(for a in "${eth0_ip6s[@]}"; do echo -n "
-          $a"; done)
-        ];
-        ipv4.routes = [ { address = "${gateway:-}"; prefixLength = 32; } ];
-        ipv6.routes = [ { address = "${gateway6:-}"; prefixLength = 128; } ];
+        $([[ -n "$eth0_ip4s" ]] && echo "ipv4.addresses = [$(echo \"$eth0_ip4s\" | while IFS= read -r a; do [[ -n \"$a\" ]] && echo -n \" $a\"; done) ];")
+        $([[ -n "$eth0_ip6s" ]] && echo "ipv6.addresses = [$(echo \"$eth0_ip6s\" | while IFS= read -r a; do [[ -n \"$a\" ]] && echo -n \" $a\"; done) ];")
+        $([[ -n "$gateway" ]] && echo "ipv4.routes = [ { address = \"$gateway\"; prefixLength = 32; } ];")
+        $([[ -n "$gateway6" ]] && echo "ipv6.routes = [ { address = \"$gateway6\"; prefixLength = 128; } ];")
       };
       $interfaces1
     };
@@ -801,6 +824,12 @@ install_package() {
     yum install -y "$package_name"
   elif command -v apt-get >/dev/null 2>&1; then
     apt-get update && apt-get install -y "$package_name"
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Syu --noconfirm "$package_name"
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper install -y "$package_name"
+  elif command -v apk >/dev/null 2>&1; then
+    apk add "$package_name"
   else
     log_error "No supported package manager found to install $package_name."
     return 1
@@ -814,33 +843,18 @@ checkEnv() {
     return 1
   fi
 
-  local missing_commands=()
-
-  ! req bzcat && missing_commands+=("bzcat")
-  ! req xzcat && missing_commands+=("xzcat")
-  ! req groupadd && missing_commands+=("groupadd")
-  ! req useradd && missing_commands+=("useradd")
-  ! req ip && missing_commands+=("ip")
-  ! req awk && missing_commands+=("awk")
-  ! req cut && missing_commands+=("cut") # `cut` is part of coreutils, check `df` as well
-  ! req df && missing_commands+=("df")
-
-  if [[ ${#missing_commands[@]} -ne 0 ]]; then
-    log_error "Missing essential commands: ${missing_commands[*]}"
-    log_error "Please install them and try again."
-    return 1
-  fi
-
-  # Check and install bzip2/xz-utils if bzcat/xzcat are missing
+  # Attempt to install bzip2/xz-utils if bzcat/xzcat are missing
   if ! req bzcat; then
+    log_info "bzcat not found, attempting to install bzip2..."
     install_package "bzip2" || {
-      log_error "Failed to install bzip2."
+      log_error "Failed to install bzip2. Please install it manually."
       return 1
     }
   fi
   if ! req xzcat; then
+    log_info "xzcat not found, attempting to install xz-utils..."
     install_package "xz-utils" || {
-      log_error "Failed to install xz-utils."
+      log_error "Failed to install xz-utils. Please install it manually."
       return 1
     }
   fi
@@ -855,6 +869,23 @@ checkEnv() {
       log_error "Missing both curl and wget, and unable to install/fake. Exiting."
       return 1
     fi
+  fi
+
+  # Now, re-check all essential commands after potential installations
+  local still_missing=()
+  ! req bzcat && still_missing+=("bzcat")
+  ! req xzcat && still_missing+=("xzcat")
+  ! req groupadd && still_missing+=("groupadd")
+  ! req useradd && still_missing+=("useradd")
+  ! req ip && still_missing+=("ip")
+  ! req awk && still_missing+=("awk")
+  ! req cut && still_missing+=("cut")
+  ! req df && still_missing+=("df")
+
+  if [[ ${#still_missing[@]} -ne 0 ]]; then
+    log_error "Even after attempting installations, the following essential commands are still missing: ${still_missing[*]}"
+    log_error "Please install them manually and try again."
+    return 1
   fi
 
   # Try to set correct permissions on SSH host keys, ignore if fails (e.g., no keys)
@@ -1032,6 +1063,31 @@ switchNixOSConfiguration() {
 
 main() {
   log_info "Starting NixOS infection process..."
+
+  # Dry-run and test-provider support
+  if [[ "$1" == "--dry-run" ]]; then
+    if [[ "$2" == --test-provider=* ]]; then
+      export PROVIDER="${2#--test-provider=}"
+      echo "[dry-run] Using test provider: $PROVIDER"
+    fi
+    echo "[dry-run] Checking environment..."
+    checkEnv || {
+      echo "[dry-run] checkEnv failed"
+      exit 1
+    }
+    echo "[dry-run] Preparing environment..."
+    prepareEnv || {
+      echo "[dry-run] prepareEnv failed"
+      exit 1
+    }
+    echo "[dry-run] Generating NixOS configuration for provider: $PROVIDER..."
+    makeConf || {
+      echo "[dry-run] makeConf failed"
+      exit 1
+    }
+    echo "Dry run completed successfully."
+    exit 0
+  fi
 
   # Determine the PROVIDER, either explicitly set or auto-detected
   if [ -z "${PROVIDER+x}" ]; then # Check if PROVIDER is unset or null
