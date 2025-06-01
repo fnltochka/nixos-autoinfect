@@ -120,7 +120,7 @@ getNixOSModulePath() {
   esac
 }
 
-# Helper function to generate common configuration.nix content
+# shellcheck disable=SC2154
 generateCommonConfig() {
   local module_import_path="$1"
   local additional_config_content="$2"
@@ -184,7 +184,7 @@ generateCommonConfig() {
 EOF
 }
 
-# Helper function to generate common hardware-configuration.nix content
+# shellcheck disable=SC2154
 generateHardwareConfig() {
   local boot_config_content="$1"
   local kernel_modules_list="$2"
@@ -394,7 +394,7 @@ EOF
   fi
 }
 
-# Example make*Conf functions for specific platforms
+# shellcheck disable=SC2154
 makeAWSConf() {
   mkdir -p /etc/nixos
   cat >/etc/nixos/configuration.nix <<EOF
@@ -404,11 +404,10 @@ makeAWSConf() {
   boot.loader.grub.device = lib.mkForce "/dev/nvme0n1";
 }
 EOF
-  # Specific network configuration is usually required for AWS
-  doNetConf=y
   newrootfslabel="nixos" # For Lightsail
 }
 
+# shellcheck disable=SC2154
 makeAzureConf() {
   mkdir -p /etc/nixos
   cat >/etc/nixos/configuration.nix <<EOF
@@ -418,9 +417,9 @@ makeAzureConf() {
   # Specific bootloader or network settings may be needed
 }
 EOF
-  doNetConf=y # Azure also often requires specific network configuration
 }
 
+# shellcheck disable=SC2154
 makeGCEConf() {
   mkdir -p /etc/nixos
   cat >/etc/nixos/configuration.nix <<EOF
@@ -430,9 +429,9 @@ makeGCEConf() {
   # Specific bootloader or network settings may be needed
 }
 EOF
-  doNetConf=y # GCE also often requires specific network configuration
 }
 
+# shellcheck disable=SC2154
 makeOpenStackConf() {
   mkdir -p /etc/nixos
   cat >/etc/nixos/configuration.nix <<EOF
@@ -441,9 +440,9 @@ makeOpenStackConf() {
   imports = [ "${modulesPath}/virtualisation/openstack.nix" ];
 }
 EOF
-  doNetConf=y # OpenStack may require specific network configuration
 }
 
+# shellcheck disable=SC2154
 makeDockerConf() {
   mkdir -p /etc/nixos
   cat >/etc/nixos/configuration.nix <<EOF
@@ -458,9 +457,9 @@ makeDockerConf() {
   networking.hostName = "nixos-container";
 }
 EOF
-  # doNetConf is not needed for Docker, network is managed by the host
 }
 
+# shellcheck disable=SC2154
 makeLXCConf() {
   mkdir -p /etc/nixos
   cat >/etc/nixos/configuration.nix <<EOF
@@ -475,9 +474,9 @@ makeLXCConf() {
   networking.hostName = "nixos-lxc-container";
 }
 EOF
-  # doNetConf is not needed for LXC, network is managed by the host
 }
 
+# shellcheck disable=SC2154
 makeQEMUConf() {
   mkdir -p /etc/nixos
   cat >/etc/nixos/configuration.nix <<EOF
@@ -487,9 +486,9 @@ makeQEMUConf() {
   # Additional settings for QEMU guests
 }
 EOF
-  doNetConf=y # QEMU often requires specific network configuration
 }
 
+# shellcheck disable=SC2154
 makeVMwareConf() {
   mkdir -p /etc/nixos
   cat >/etc/nixos/configuration.nix <<EOF
@@ -499,9 +498,9 @@ makeVMwareConf() {
   # Additional settings for VMware guests
 }
 EOF
-  doNetConf=y # VMware often requires specific network configuration
 }
 
+# shellcheck disable=SC2154
 makeVirtualBoxConf() {
   mkdir -p /etc/nixos
   cat >/etc/nixos/configuration.nix <<EOF
@@ -511,9 +510,9 @@ makeVirtualBoxConf() {
   # Additional settings for VirtualBox guests
 }
 EOF
-  doNetConf=y # VirtualBox often requires specific network configuration
 }
 
+# shellcheck disable=SC2154
 makeXenConf() {
   mkdir -p /etc/nixos
   cat >/etc/nixos/configuration.nix <<EOF
@@ -524,7 +523,6 @@ makeXenConf() {
   boot.loader.grub.device = "/dev/xvda"; # Example for Xen, may require configuration
 }
 EOF
-  doNetConf=y # Xen may require specific network configuration
 }
 
 get_interface_address_info() {
@@ -558,62 +556,52 @@ get_default_gateway() {
 
 makeNetworkingConf() {
   local IFS=$'\n'
-  local eth0_name
-  # Try to find the primary network interface with an IP address
-  eth0_name=$(ip -4 address show | grep inet | grep -v 127.0.0.1 | head -n 1 | awk -F': ' '{print $2}' | awk '{print $1}')
-  if [ -z "$eth0_name" ]; then
-    log_warning "No primary network interface with an IP address found, trying default interface."
-    eth0_name=$(ip address show | grep '^2:' | awk -F': ' '{print $2}')
-  fi
-  if [ -z "$eth0_name" ]; then
-    log_error "No network interface found, networking configuration will be skipped."
+  # Find the first non-loopback, UP interface with an IPv4 address
+  local primary_iface
+  primary_iface=$(ip -o -4 addr show up | awk '!/ lo / {print $2; exit}')
+  if [ -z "$primary_iface" ]; then
+    log_error "No active non-loopback interface with IPv4 address found. Networking configuration will be skipped."
     return 1
   fi
-  log_info "Using $eth0_name as primary network interface."
-  local eth0_ip4s=$(get_interface_address_info "$eth0_name" "4")
-  local eth0_ip6s=$(get_interface_address_info "$eth0_name" "6")
-  local gateway=$(get_default_gateway "$eth0_name" "4")
-  local gateway6=$(get_default_gateway "$eth0_name" "6")
-  local ether0=$(get_interface_mac_address "$eth0_name")
+  log_info "Detected primary network interface: $primary_iface"
 
-  local eth1_name=""
-  local eth1_ip4s=""
-  local eth1_ip6s=""
-  local ether1=""
-  local interfaces1=""
-  local extraRules1=""
+  # Get IPv4 addresses for the interface
+  local ip4s
+  ip4s=$(ip -o -4 addr show dev "$primary_iface" | awk '{print $4}' | while read -r cidr; do
+    local ip=${cidr%/*}
+    local prefix=${cidr#*/}
+    echo "{ address=\"$ip\"; prefixLength=$prefix; }"
+  done)
 
-  eth1_name=$(ip address show | grep '^3:' | awk -F': ' '{print $2}') || true
-  if [ -n "$eth1_name" ]; then
-    log_info "Found secondary network interface: $eth1_name"
-    eth1_ip4s=$(get_interface_address_info "$eth1_name" "4")
-    eth1_ip6s=$(get_interface_address_info "$eth1_name" "6")
-    ether1=$(get_interface_mac_address "$eth1_name")
-    interfaces1=$(
-      cat <<EOF
-      $eth1_name = {
-        ipv4.addresses = [$(echo "$eth1_ip4s" | while IFS= read -r a; do echo -n "
-          $a"; done)
-        ];
-        ipv6.addresses = [$(echo "$eth1_ip6s" | while IFS= read -r a; do echo -n "
-          $a"; done)
-        ];
-      };
-EOF
-    )
-    extraRules1="ATTR{address}==\"${ether1}\", NAME=\"${eth1_name}\""
+  # Get IPv6 addresses for the interface
+  local ip6s
+  ip6s=$(ip -o -6 addr show dev "$primary_iface" | awk '{print $4}' | while read -r cidr; do
+    local ip=${cidr%/*}
+    local prefix=${cidr#*/}
+    echo "{ address=\"$ip\"; prefixLength=$prefix; }"
+  done)
+
+  # Get default gateway and interface
+  local gateway
+  local gateway_iface
+  gateway=$(ip route get 1 2>/dev/null | awk '/via/ {for(i=1;i<=NF;i++) if ($i=="via") print $(i+1)}')
+  gateway_iface=$(ip route get 1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}')
+  if [ -n "$gateway" ]; then
+    log_info "Detected default gateway: $gateway via $gateway_iface"
   fi
 
+  # Get MAC address
+  local ether
+  ether=$(ip link show "$primary_iface" | awk '/ether/ {print $2}')
+
+  # Nameservers
   local nameservers=()
   if [ -f /etc/resolv.conf ]; then
     while IFS= read -r line; do
-      # Remove comments and empty lines
       line=$(echo "$line" | sed 's/#.*$//g' | xargs)
       [[ -z "$line" ]] && continue
-
       if [[ "$line" =~ ^nameserver[[:space:]]+([0-9.a-fA-F:]+)$ ]]; then
         local ip="${BASH_REMATCH[1]}"
-        # Replace local loopback with public DNS
         if [[ "$ip" =~ ^127\. || "$ip" == "::1" ]]; then
           ip="8.8.8.8"
         fi
@@ -626,7 +614,7 @@ EOF
   fi
 
   local use_predictable_names_config=""
-  if [[ "$eth0_name" = eth* ]]; then
+  if [[ "$primary_iface" = eth* ]]; then
     use_predictable_names_config="usePredictableInterfaceNames = lib.mkForce false;"
   else
     use_predictable_names_config="usePredictableInterfaceNames = lib.mkForce true;"
@@ -638,22 +626,18 @@ EOF
   networking = {
     nameservers = [ ${nameservers[*]} ];
     $([[ -n "$gateway" ]] && echo "defaultGateway = \"$gateway\";")
-    $([[ -n "$gateway6" ]] && echo "defaultGateway6 = { address = \"$gateway6\"; interface = \"$eth0_name\"; };")
     dhcpcd.enable = false;
     $use_predictable_names_config
     interfaces = {
-      $eth0_name = {
-        $([[ -n "$eth0_ip4s" ]] && echo "ipv4.addresses = [$(echo \"$eth0_ip4s\" | while IFS= read -r a; do [[ -n \"$a\" ]] && echo -n \" $a\"; done) ];")
-        $([[ -n "$eth0_ip6s" ]] && echo "ipv6.addresses = [$(echo \"$eth0_ip6s\" | while IFS= read -r a; do [[ -n \"$a\" ]] && echo -n \" $a\"; done) ];")
+      $primary_iface = {
+        $([[ -n "$ip4s" ]] && echo "ipv4.addresses = [ $ip4s ];")
+        $([[ -n "$ip6s" ]] && echo "ipv6.addresses = [ $ip6s ];")
         $([[ -n "$gateway" ]] && echo "ipv4.routes = [ { address = \"$gateway\"; prefixLength = 32; } ];")
-        $([[ -n "$gateway6" ]] && echo "ipv6.routes = [ { address = \"$gateway6\"; prefixLength = 128; } ];")
       };
-      $interfaces1
     };
   };
   services.udev.extraRules = ''
-    ATTR{address}=="${ether0}", NAME="${eth0_name}"
-    $extraRules1
+    ATTR{address}=="${ether}", NAME="${primary_iface}"
   '';
 }
 EOF
@@ -1168,4 +1152,4 @@ main() {
   fi
 }
 
-main
+main "$@"
