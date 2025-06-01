@@ -31,19 +31,24 @@ NixOS-AutoInfect is a script for installing NixOS on non-NixOS hosts. It is desi
 
 1. **Read and understand the [script](nixos-autoinfect)**, as it **destroys** your existing root filesystem.
 2. Provision a fresh VPS, dedicated server, or cloud VM running a non-Nix distro (Debian, Ubuntu, CentOS, etc.).
-3. Ensure root has SSH key access (no password or minimal password). This is critical because once NixOS is installed, root login over SSH will require an SSH key (unless you use the randomly generated password).
+3. After installation, SSH login as root with password is enabled (the password is shown by the script before reboot). For better security, it is recommended to also add an SSH key for root and/or disable password login after your first login.
 4. Run something like:
 
    ```bash
    curl https://raw.githubusercontent.com/fnltochka/nixos-autoinfect/main/nixos-autoinfect \
-     | NIX_CHANNEL=nixos-25.05 bash -x
+     | NIX_CHANNEL=nixos-25.05 NIXOS_STATE_VERSION=25.05 bash -x
    ```
 
    You can specify a different `NIX_CHANNEL`, e.g. `nixos-25.05`.
+   You can also set `NIXOS_STATE_VERSION` to control the generated `system.stateVersion` (defaults to `25.05`).
+   See [system.stateVersion documentation](https://search.nixos.org/options?channel=unstable&show=system.stateVersion&from=0&size=50&sort=relevance&type=packages&query=system.stateVersion) for details.
 
 At the end of the process, your system reboots into NixOS.  
 The script prints out the randomly generated **root password** before reboot, if none was previously set.  
 **Remember** to store it safely or change it immediately.
+
+**Note:** After installation, SSH login as root with password is enabled by default (`PermitRootLogin yes`, `PasswordAuthentication true`).
+For security, it is strongly recommended to change the root password and/or disable password login after your first login.
 
 ---
 
