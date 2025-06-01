@@ -80,6 +80,8 @@ You can **explicitly set** the provider by using the `PROVIDER` environment vari
 This script has been tested on:
 
 - Ubuntu 24.04 LTS
+- Ubuntu 22.04 LTS
+- Ubuntu 20.04 LTS
 - Debian 12 (Bookworm)
 
 If you use another platform, the script will use the default logic suitable for most bare-metal and virtual servers.
