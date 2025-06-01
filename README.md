@@ -93,8 +93,7 @@ If you use another platform, the script will use the default logic suitable for 
 Use at your own risk!  
 This script removes and replaces your OS with NixOS. Make sure you have backups or that your server is easily re-deployable.
 
-If you encounter issues, please open an issue or pull request in this fork's repository:  
-[https://github.com/fnltochka/nixos-autoinfect](https://github.com/fnltochka/nixos-autoinfect).
+If you encounter issues, please open an issue or pull request.
 
 ---
 
