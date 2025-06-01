@@ -1,0 +1,1115 @@
+#!/usr/bin/env bash
+#
+# nixos-autoinfect: A script to install NixOS on non-NixOS hosts.
+#
+# This fork focuses on maximum compatibility with common Linux distributions
+# (Debian, Ubuntu, CentOS, etc.) and supports specific cloud/virtualization platforms.
+# It aims to provide a streamlined, automated, and robust NixOS installation process.
+#
+# Key features and modifications:
+#  - Auto-detection and configuration for various cloud/virtualization providers (AWS, Azure, GCE, OpenStack, Docker, LXC, QEMU, VMware, VirtualBox, Xen, Hetzner Cloud).
+#  - Disables firewall by default in /etc/nixos/configuration.nix.
+#  - Generates a random root password at install time and displays it before reboot (if openssl is available).
+#  - Skips configuration generation if both configuration.nix and hardware-configuration.nix already exist.
+#  - Sets NixOS channel to 25.05 by default.
+#  - Improved error handling and logging for a more robust installation experience.
+#  - Refactored code for better maintainability, readability, and adherence to DRY principles.
+#
+
+set -e -o pipefail
+
+# Global variable for root password, set by makeConf
+rootPassword=""
+
+# Function to print messages to stderr
+log_error() {
+  printf "ERROR: %s\n" "$@" >&2
+}
+
+log_warning() {
+  printf "WARNING: %s\n" "$@" >&2
+}
+
+log_info() {
+  printf "INFO: %s\n" "$@"
+}
+
+autodetectProvider() {
+  # Reset PROVIDER before attempting auto-detection
+  PROVIDER=""
+
+  # Check for Hetzner Cloud (specific file check)
+  if [ -e /etc/hetzner-build ]; then
+    PROVIDER="hetznercloud"
+    return 0
+  fi
+
+  # Check DMI for cloud providers and virtualizations
+  if [ -r /sys/class/dmi/id/product_name ]; then
+    case "$(cat /sys/class/dmi/id/product_name)" in
+    "Amazon EC2"* | "Lightsail"*)
+      PROVIDER="aws"
+      return 0
+      ;;
+    "Microsoft Azure"*)
+      PROVIDER="azure"
+      return 0
+      ;;
+    "Google Compute Engine"*)
+      PROVIDER="gce"
+      return 0
+      ;;
+    "OpenStack Nova"*)
+      PROVIDER="openstack"
+      return 0
+      ;;
+    "VirtualBox"*)
+      PROVIDER="virtualbox"
+      return 0
+      ;;
+    "VMware Virtual Platform"*)
+      PROVIDER="vmware"
+      return 0
+      ;;
+    "KVM"*)
+      PROVIDER="qemu"
+      return 0
+      ;; # QEMU often shows itself as KVM
+    "Xen HVM domU"*)
+      PROVIDER="xen"
+      return 0
+      ;;
+    esac
+  fi
+
+  # Check for Docker/LXC
+  if [ -f /.dockerenv ]; then
+    PROVIDER="docker"
+    return 0
+  elif grep -qa container=lxc /proc/1/environ; then
+    PROVIDER="lxc"
+    return 0
+  fi
+
+  # Check /proc/cpuinfo for Xen
+  if grep -qa xen /proc/cpuinfo; then
+    PROVIDER="xen"
+    return 0
+  fi
+
+  # If nothing is found, PROVIDER is not set, which will trigger the "generic" default
+}
+
+# Helper function to get the NixOS module path for a given provider
+getNixOSModulePath() {
+  local provider_name="$1"
+  case "$provider_name" in
+  "aws") echo "virtualisation/amazon-image.nix" ;;
+  "azure") echo "virtualisation/azure-image.nix" ;;
+  "gce") echo "virtualisation/gce-image.nix" ;;
+  "openstack") echo "virtualisation/openstack.nix" ;;
+  "docker") echo "virtualisation/docker.nix" ;;
+  "lxc") echo "virtualisation/lxc-container.nix" ;;
+  "qemu") echo "virtualisation/qemu-guest.nix" ;;
+  "vmware") echo "virtualisation/vmware-guest.nix" ;;
+  "virtualbox") echo "virtualisation/virtualbox-guest.nix" ;;
+  "xen") echo "virtualisation/xen-domu.nix" ;;
+  *)
+    # No specific module for generic, or specific modules handled by other logic
+    echo ""
+    ;;
+  esac
+}
+
+# Helper function to generate common configuration.nix content
+generateCommonConfig() {
+  local module_import_path="$1"
+  local additional_config_content="$2"
+  local ssh_keys_content="$3"
+  local hashed_password="$4"
+  local include_networking_conf=$5
+
+  mkdir -p /etc/nixos
+
+  local imports_block=""
+  if [[ -n "$module_import_path" ]]; then
+    # shellcheck disable=SC2154
+    imports_block="${modulesPath}/${module_import_path}"
+  fi
+
+  local networking_import_line=""
+  if $include_networking_conf; then
+    networking_import_line="./networking.nix # generated at runtime by nixos-infect"
+  fi
+
+  cat >/etc/nixos/configuration.nix <<EOF
+{ ... }: {
+  imports = [
+    ./hardware-configuration.nix
+    ${networking_import_line}
+    ${imports_block}
+    $NIXOS_IMPORT
+  ];
+
+  boot.tmp.cleanOnBoot = true;
+  zramSwap.enable = ${zramswap};
+
+  # Basic host settings
+  networking.hostName = "$(hostname -s)";
+  networking.domain = "$(hostname -d)";
+
+  # Disable firewall
+  networking.firewall.enable = false;
+
+  # Enable SSH
+  services.openssh.enable = true;
+
+  # Root password (hashed)
+  users.users.root.initialHashedPassword = "${hashed_password}";
+
+  # Root SSH keys
+  users.users.root.openssh.authorizedKeys.keys = [
+    ${ssh_keys_content}
+  ];
+
+  # Set system.stateVersion to 25.05
+  system.stateVersion = "25.05";
+
+  ${additional_config_content}
+}
+EOF
+}
+
+# Helper function to generate common hardware-configuration.nix content
+generateHardwareConfig() {
+  local boot_config_content="$1"
+  local kernel_modules_list="$2"
+  local swap_config_content="$3"
+
+  cat >/etc/nixos/hardware-configuration.nix <<EOF
+{ modulesPath, ... }:
+{
+  # In general, we don't import specific virtualization modules here, relying on PROVIDER
+  # imports = [ (modulesPath + "/profiles/qemu-guest.nix") ];
+${boot_config_content}
+  boot.initrd.availableKernelModules = [ ${kernel_modules_list} ];
+  # Remove hardcoded nvme, relying on NixOS auto-detection
+  # boot.initrd.kernelModules = [ "nvme" ];
+  fileSystems."/".device = "$rootfsdev";
+  fileSystems."/".fsType = "$rootfstype";
+  ${swap_config_content}
+}
+EOF
+}
+
+makeConf() {
+  # Skip generation only if BOTH config and hardware files exist
+  if [ -e /etc/nixos/configuration.nix ] && [ -e /etc/nixos/hardware-configuration.nix ]; then
+    log_info "Existing configuration files found, skipping generation."
+    return 0
+  fi
+
+  log_info "Using configuration for provider: $PROVIDER"
+
+  local module_file_path=""
+  local additional_nixos_config=""
+  local do_networking_conf=false
+  local specific_rootfs_label=""
+  local grub_device_override_config=""
+
+  case "$PROVIDER" in
+  "aws" | "lightsail")
+    module_file_path="virtualisation/amazon-image.nix"
+    grub_device_override_config="boot.loader.grub.device = lib.mkForce \"/dev/nvme0n1\";"
+    do_networking_conf=true
+    specific_rootfs_label="nixos"
+    ;;
+  "azure")
+    module_file_path="virtualisation/azure-image.nix"
+    do_networking_conf=true
+    ;;
+  "gce")
+    module_file_path="virtualisation/gce-image.nix"
+    do_networking_conf=true
+    ;;
+  "openstack")
+    module_file_path="virtualisation/openstack.nix"
+    do_networking_conf=true
+    ;;
+  "docker")
+    module_file_path="virtualisation/docker.nix"
+    additional_nixos_config=$(
+      cat <<EOD
+  boot.isContainer = true;
+  boot.loader.systemd-boot.enable = false;
+  boot.loader.grub.enable = false;
+  networking.useDHCP = false;
+  networking.hostName = "nixos-container";
+EOD
+    )
+    do_networking_conf=false # Network is managed by the host
+    ;;
+  "lxc")
+    module_file_path="virtualisation/lxc-container.nix"
+    additional_nixos_config=$(
+      cat <<EOD
+  boot.isContainer = true;
+  boot.loader.systemd-boot.enable = false;
+  boot.loader.grub.enable = false;
+  networking.useDHCP = false;
+  networking.hostName = "nixos-lxc-container";
+EOD
+    )
+    do_networking_conf=false # Network is managed by the host
+    ;;
+  "qemu")
+    module_file_path="virtualisation/qemu-guest.nix"
+    do_networking_conf=true
+    ;;
+  "vmware")
+    module_file_path="virtualisation/vmware-guest.nix"
+    do_networking_conf=true
+    ;;
+  "virtualbox")
+    module_file_path="virtualisation/virtualbox-guest.nix"
+    do_networking_conf=true
+    ;;
+  "xen")
+    module_file_path="virtualisation/xen-domu.nix"
+    grub_device_override_config="boot.loader.grub.device = \"/dev/xvda\";"
+    do_networking_conf=true
+    ;;
+  "generic")
+    module_file_path=""
+    do_networking_conf=true # For generic, networking setup is usually needed
+    ;;
+  *)
+    log_error "Unsupported provider: $PROVIDER. Falling back to generic configuration."
+    module_file_path=""
+    do_networking_conf=true
+    PROVIDER="generic" # Ensure PROVIDER is set to generic for subsequent logic
+    ;;
+  esac
+
+  # Gather SSH authorized_keys from common paths
+  local IFS=$'\n'
+  local keys=""
+  for trypath in \
+    /root/.ssh/authorized_keys \
+    /home/$SUDO_USER/.ssh/authorized_keys \
+    "$HOME"/.ssh/authorized_keys; do
+    if [[ -r "$trypath" ]]; then
+      keys=$(sed -E 's/^[^#].*[[:space:]]((sk-ssh|sk-ecdsa|ssh|ecdsa)-[^[:space:]]+)[[:space:]]+([^[:space:]]+)([[:space:]]*.*)$/\1 \3\4/' "$trypath")
+      if [[ -n "$keys" ]]; then
+        log_info "Found SSH keys in $trypath"
+        break
+      fi
+    fi
+  done
+
+  local ssh_keys_content=""
+  if [[ -n "$keys" ]]; then
+    while read -r line; do
+      line=$(echo -n "$line" | sed 's/\r//g')
+      trimmed_line=$(echo -n "$line" | xargs)
+      ssh_keys_content+="'$trimmed_line' "
+    done <<<"$keys"
+  fi
+
+  # Generate random root password & hashed version
+  local passHash="*" # Default to disabled password login
+  if command -v openssl >/dev/null 2>&1; then
+    rootPassword=$(openssl rand -base64 12)
+    passHash=$(openssl passwd -6 "$rootPassword")
+  else
+    log_warning "openssl not found, root password will not be set."
+  fi
+
+  # Generate configuration.nix
+  generateCommonConfig \
+    "$module_file_path" \
+    "$additional_nixos_config" \
+    "$ssh_keys_content" \
+    "$passHash" \
+    "$do_networking_conf"
+
+  local bootcfg_content=""
+  if isEFI; then
+    bootcfg_content=$(
+      cat <<EOF
+  boot.loader.grub = {
+    efiSupport = true;
+    efiInstallAsRemovable = true;
+    device = "nodev";
+  };
+  fileSystems."/boot" = { device = "$esp"; fsType = "vfat"; };
+EOF
+    )
+  else
+    bootcfg_content=$(
+      cat <<EOF
+  boot.loader.grub.device = "$grubdev";
+EOF
+    )
+  fi
+
+  if [[ -n "$grub_device_override_config" ]]; then
+    bootcfg_content="$grub_device_override_config"
+  fi
+
+  # These modules are universal enough for many VMs and some physical machines
+  local availableKernelModules=('"ata_piix"' '"uhci_hcd"' '"xen_blkfront"')
+  if isX86_64; then
+    availableKernelModules+=('"vmw_pvscsi"')
+  fi
+  local kernel_modules_string="${availableKernelModules[*]}"
+
+  # Generate hardware-configuration.nix
+  generateHardwareConfig \
+    "$bootcfg_content" \
+    "$kernel_modules_string" \
+    "$swapcfg"
+
+  if $do_networking_conf; then
+    log_info "Generating networking configuration..."
+    makeNetworkingConf
+  fi
+
+  # Set newrootfslabel if applicable
+  if [[ -n "$specific_rootfs_label" ]]; then
+    newrootfslabel="$specific_rootfs_label"
+  fi
+}
+
+# Example make*Conf functions for specific platforms
+makeAWSConf() {
+  mkdir -p /etc/nixos
+  cat >/etc/nixos/configuration.nix <<EOF
+{ config, pkgs, modulesPath, lib, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/amazon-image.nix" ];
+  boot.loader.grub.device = lib.mkForce "/dev/nvme0n1";
+}
+EOF
+  # Specific network configuration is usually required for AWS
+  doNetConf=y
+  newrootfslabel="nixos" # For Lightsail
+}
+
+makeAzureConf() {
+  mkdir -p /etc/nixos
+  cat >/etc/nixos/configuration.nix <<EOF
+{ config, pkgs, modulesPath, lib, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/azure-image.nix" ];
+  # Specific bootloader or network settings may be needed
+}
+EOF
+  doNetConf=y # Azure also often requires specific network configuration
+}
+
+makeGCEConf() {
+  mkdir -p /etc/nixos
+  cat >/etc/nixos/configuration.nix <<EOF
+{ config, pkgs, modulesPath, lib, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/gce-image.nix" ];
+  # Specific bootloader or network settings may be needed
+}
+EOF
+  doNetConf=y # GCE also often requires specific network configuration
+}
+
+makeOpenStackConf() {
+  mkdir -p /etc/nixos
+  cat >/etc/nixos/configuration.nix <<EOF
+{ config, pkgs, modulesPath, lib, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/openstack.nix" ];
+}
+EOF
+  doNetConf=y # OpenStack may require specific network configuration
+}
+
+makeDockerConf() {
+  mkdir -p /etc/nixos
+  cat >/etc/nixos/configuration.nix <<EOF
+{ config, pkgs, modulesPath, lib, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/docker.nix" ];
+  # Additional settings for Docker containers (e.g., minimal kernel)
+  boot.isContainer = true;
+  boot.loader.systemd-boot.enable = false; # No need for a bootloader in a container
+  boot.loader.grub.enable = false;
+  networking.useDHCP = false;
+  networking.hostName = "nixos-container";
+}
+EOF
+  # doNetConf is not needed for Docker, network is managed by the host
+}
+
+makeLXCConf() {
+  mkdir -p /etc/nixos
+  cat >/etc/nixos/configuration.nix <<EOF
+{ config, pkgs, modulesPath, lib, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/lxc-container.nix" ];
+  # Additional settings for LXC containers
+  boot.isContainer = true;
+  boot.loader.systemd-boot.enable = false;
+  boot.loader.grub.enable = false;
+  networking.useDHCP = false;
+  networking.hostName = "nixos-lxc-container";
+}
+EOF
+  # doNetConf is not needed for LXC, network is managed by the host
+}
+
+makeQEMUConf() {
+  mkdir -p /etc/nixos
+  cat >/etc/nixos/configuration.nix <<EOF
+{ config, pkgs, modulesPath, lib, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/qemu-guest.nix" ];
+  # Additional settings for QEMU guests
+}
+EOF
+  doNetConf=y # QEMU often requires specific network configuration
+}
+
+makeVMwareConf() {
+  mkdir -p /etc/nixos
+  cat >/etc/nixos/configuration.nix <<EOF
+{ config, pkgs, modulesPath, lib, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/vmware-guest.nix" ];
+  # Additional settings for VMware guests
+}
+EOF
+  doNetConf=y # VMware often requires specific network configuration
+}
+
+makeVirtualBoxConf() {
+  mkdir -p /etc/nixos
+  cat >/etc/nixos/configuration.nix <<EOF
+{ config, pkgs, modulesPath, lib, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/virtualbox-guest.nix" ];
+  # Additional settings for VirtualBox guests
+}
+EOF
+  doNetConf=y # VirtualBox often requires specific network configuration
+}
+
+makeXenConf() {
+  mkdir -p /etc/nixos
+  cat >/etc/nixos/configuration.nix <<EOF
+{ config, pkgs, modulesPath, lib, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/xen-domu.nix" ];
+  # Additional settings for Xen DomU
+  boot.loader.grub.device = "/dev/xvda"; # Example for Xen, may require configuration
+}
+EOF
+  doNetConf=y # Xen may require specific network configuration
+}
+
+get_interface_address_info() {
+  local iface="$1"
+  local ip_version="$2" # can be "4" or "6"
+  local ip_pattern="inet "
+  local sed_pattern="s|.*inet ([0-9.]+)/([0-9]+).*|{ address=\"\\1\"; prefixLength=\\2; }|\""
+
+  if [[ "$ip_version" == "6" ]]; then
+    ip_pattern="inet6 "
+    sed_pattern="s|.*inet6 ([0-9a-f:]+)/([0-9]+).*|{ address=\"\\1\"; prefixLength=\\2; }|\""
+  fi
+
+  ip address show dev "$iface" | grep "$ip_pattern" | sed -r "$sed_pattern" || true
+}
+
+get_interface_mac_address() {
+  local iface="$1"
+  ip address show dev "$iface" | grep "link/ether" | sed -r 's|.*link/ether ([0-9a-f:]+) .*|\\1|' || true
+}
+
+get_default_gateway() {
+  local iface="$1"
+  local ip_version="$2" # can be "4" or "6"
+  if [[ "$ip_version" == "6" ]]; then
+    ip -6 route show dev "$iface" | grep default | sed -r 's|default via ([0-9a-f:]+).*|\\1|' || true
+  else
+    ip route show dev "$iface" | grep default | sed -r 's|default via ([0-9.]+).*|\\1|' || true
+  fi
+}
+
+makeNetworkingConf() {
+  local IFS=$'\n'
+  local eth0_name
+  eth0_name=$(ip address show | grep '^2:' | awk -F': ' '{print $2}')
+  if [ -z "$eth0_name" ]; then
+    log_warning "No primary network interface found, networking configuration may be incomplete."
+    return 1
+  fi
+  local eth0_ip4s=$(get_interface_address_info "$eth0_name" "4")
+  local eth0_ip6s=$(get_interface_address_info "$eth0_name" "6")
+  local gateway=$(get_default_gateway "$eth0_name" "4")
+  local gateway6=$(get_default_gateway "$eth0_name" "6")
+  local ether0=$(get_interface_mac_address "$eth0_name")
+
+  local eth1_name=""
+  local eth1_ip4s=""
+  local eth1_ip6s=""
+  local ether1=""
+  local interfaces1=""
+  local extraRules1=""
+
+  eth1_name=$(ip address show | grep '^3:' | awk -F': ' '{print $2}') || true
+  if [ -n "$eth1_name" ]; then
+    eth1_ip4s=$(get_interface_address_info "$eth1_name" "4")
+    eth1_ip6s=$(get_interface_address_info "$eth1_name" "6")
+    ether1=$(get_interface_mac_address "$eth1_name")
+    interfaces1=$(
+      cat <<EOF
+      $eth1_name = {
+        ipv4.addresses = [$(for a in "${eth1_ip4s[@]}"; do echo -n "
+          $a"; done)
+        ];
+        ipv6.addresses = [$(for a in "${eth1_ip6s[@]}"; do echo -n "
+          $a"; done)
+        ];
+      };
+EOF
+    )
+    extraRules1="ATTR{address}==\"${ether1}\", NAME=\"${eth1_name}\""
+  fi
+
+  local nameservers=()
+  if [ -f /etc/resolv.conf ]; then
+    mapfile -t nameservers < <(grep ^nameserver /etc/resolv.conf | sed -r \
+      -e 's/^nameserver[[:space:]]+([0-9.a-fA-F:]+).*/"\1"/' \
+      -e 's/127[0-9.]+/8.8.8.8/' \
+      -e 's/::1/8.8.8.8/')
+  else
+    log_warning "/etc/resolv.conf not found, using default nameservers."
+    nameservers=("8.8.8.8" "8.8.4.4")
+  fi
+
+  local use_predictable_names_config=""
+  if [[ "$eth0_name" = eth* ]]; then
+    use_predictable_names_config="usePredictableInterfaceNames = lib.mkForce false;"
+  else
+    use_predictable_names_config="usePredictableInterfaceNames = lib.mkForce true;"
+  fi
+
+  cat >/etc/nixos/networking.nix <<EOF
+{ lib, ... }: {
+  # Generated by nixos-infect
+  networking = {
+    nameservers = [ ${nameservers[@]} ];
+    defaultGateway = "${gateway:-}";
+    defaultGateway6 = {
+      address = "${gateway6:-}";
+      interface = "${eth0_name}";
+    };
+    dhcpcd.enable = false;
+    $use_predictable_names_config
+    interfaces = {
+      $eth0_name = {
+        ipv4.addresses = [$(for a in "${eth0_ip4s[@]}"; do echo -n "
+          $a"; done)
+        ];
+        ipv6.addresses = [$(for a in "${eth0_ip6s[@]}"; do echo -n "
+          $a"; done)
+        ];
+        ipv4.routes = [ { address = "${gateway:-}"; prefixLength = 32; } ];
+        ipv6.routes = [ { address = "${gateway6:-}"; prefixLength = 128; } ];
+      };
+      $interfaces1
+    };
+  };
+  services.udev.extraRules = ''
+    ATTR{address}=="${ether0}", NAME="${eth0_name}"
+    $extraRules1
+  '';
+}
+EOF
+}
+
+checkExistingSwap() {
+  local SWAPSHOW
+  SWAPSHOW=$(swapon --show --noheadings --raw)
+  zramswap=true
+  swapcfg=""
+  if [[ -n "$SWAPSHOW" ]]; then
+    local SWAP_DEVICE="${SWAPSHOW%% *}"
+    if [[ "$SWAP_DEVICE" == "/dev/"* ]]; then
+      zramswap=false
+      swapcfg="swapDevices = [ { device = \"${SWAP_DEVICE}\"; } ];"
+      NO_SWAP=true
+      log_info "Existing swap detected on $SWAP_DEVICE."
+    else
+      log_info "Existing non-device swap found, using zramswap."
+    fi
+  else
+    log_info "No existing swap found."
+  fi
+}
+
+makeSwap() {
+  local swapFile
+  swapFile=$(mktemp /tmp/nixos-infect.XXXXX.swp)
+  log_info "Creating temporary swap file at $swapFile..."
+  if ! dd if=/dev/zero of="${swapFile}" bs=1M count=$((1 * 1024)); then
+    log_error "Failed to create swap file."
+    return 1
+  fi
+  if ! chmod 0600 "$swapFile"; then
+    log_warning "Failed to set permissions on swap file $swapFile."
+  fi
+  if ! mkswap "$swapFile"; then
+    log_error "Failed to format swap file $swapFile."
+    return 1
+  fi
+  if ! swapon -v "$swapFile"; then
+    log_error "Failed to enable swap file $swapFile."
+    return 1
+  fi
+  log_info "Temporary swap file enabled."
+}
+
+removeSwap() {
+  log_info "Disabling all swap devices..."
+  swapoff -a || log_warning "Failed to disable all swap devices. Some swap may persist."
+  log_info "Removing temporary swap files..."
+  rm -vf /tmp/nixos-infect.*.swp || log_warning "No temporary swap files to remove or removal failed."
+}
+
+isX86_64() {
+  [[ "$(uname -m)" == "x86_64" ]]
+}
+
+isEFI() {
+  [ -d /sys/firmware/efi ]
+}
+
+findESP() {
+  local esp_path=""
+  for d in /boot/EFI /boot/efi /boot; do
+    [[ ! -d "$d" ]] && continue
+    if [[ "$d" == "$(df "$d" --output=target | sed 1d)" ]]; then
+      esp_path="$(df "$d" --output=source | sed 1d)"
+      break
+    fi
+  done
+  [[ -z "$esp_path" ]] && {
+    log_error "No ESP mount point found."
+    return 1
+  }
+  for uuid in /dev/disk/by-uuid/*; do
+    [[ "$(readlink -f "$uuid")" == "$esp_path" ]] && {
+      echo "$uuid"
+      return 0
+    }
+  done
+  log_error "Failed to find UUID for ESP: $esp_path."
+  return 1
+}
+
+prepareEnv() {
+  log_info "Preparing environment variables and directories..."
+  # $esp and $grubdev are used in makeConf()
+  if isEFI; then
+    esp="$(findESP)" || {
+      log_error "Failed to determine EFI System Partition (ESP). Exiting."
+      exit 1
+    }
+  else
+    for grubdev_candidate in /dev/vda /dev/sda /dev/xvda /dev/nvme0n1; do
+      if [[ -e "$grubdev_candidate" ]]; then
+        grubdev="$grubdev_candidate"
+        log_info "Detected GRUB device: $grubdev."
+        break
+      fi
+    done
+    if [[ -z "$grubdev" ]]; then
+      log_error "Failed to detect a suitable GRUB device. Exiting."
+      exit 1
+    fi
+  fi
+
+  # Identify the root fs
+  rootfsdev="$(mount | grep "on / type" | awk '{print $1;}')"
+  rootfstype="$(df "$rootfsdev" --output=fstype | sed 1d)"
+  if [[ -z "$rootfsdev" || -z "$rootfstype" ]]; then
+    log_error "Failed to identify current root filesystem device or type. Exiting."
+    exit 1
+  fi
+  log_info "Identified root filesystem: device=$rootfsdev, type=$rootfstype."
+
+  export USER="root"
+  export HOME="/root"
+  log_info "Set USER to root and HOME to /root."
+
+  # Create /nix if missing
+  if ! mkdir -p /nix; then
+    log_error "Failed to create /nix directory. Exiting."
+    exit 1
+  fi
+  if ! chmod 0755 /nix; then
+    log_warning "Failed to set permissions on /nix directory."
+  fi
+  log_info "Ensured /nix directory exists and has correct permissions."
+}
+
+fakeCurlUsingWget() {
+  command -v wget && {
+    log_info "curl not found, faking it using wget."
+    curl() {
+      local wget_args=""
+      local isStdout=1
+      for arg in "$@"; do
+        case "$arg" in
+        "-o")
+          wget_args+="-O "
+          isStdout=0
+          ;;
+        "-O") isStdout=0 ;;
+        "-L") ;;
+        *) wget_args+="$arg " ;;
+        esac
+      done
+      [[ "$isStdout" -eq 1 ]] && wget_args+="-O-"
+
+      eval "wget $wget_args"
+    }
+    export -f curl
+  }
+}
+
+req() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+# Helper function to install a package based on available package managers
+install_package() {
+  local package_name="$1"
+  log_info "Attempting to install $package_name..."
+  if command -v dnf >/dev/null 2>&1; then
+    dnf install -y "$package_name"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y "$package_name"
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update && apt-get install -y "$package_name"
+  else
+    log_error "No supported package manager found to install $package_name."
+    return 1
+  fi
+  return 0
+}
+
+checkEnv() {
+  if [[ "$(whoami)" != "root" ]]; then
+    log_error "Must run as root."
+    return 1
+  fi
+
+  local missing_commands=()
+
+  ! req bzcat && missing_commands+=("bzcat")
+  ! req xzcat && missing_commands+=("xzcat")
+  ! req groupadd && missing_commands+=("groupadd")
+  ! req useradd && missing_commands+=("useradd")
+  ! req ip && missing_commands+=("ip")
+  ! req awk && missing_commands+=("awk")
+  ! req cut && missing_commands+=("cut") # `cut` is part of coreutils, check `df` as well
+  ! req df && missing_commands+=("df")
+
+  if [[ ${#missing_commands[@]} -ne 0 ]]; then
+    log_error "Missing essential commands: ${missing_commands[*]}"
+    log_error "Please install them and try again."
+    return 1
+  fi
+
+  # Check and install bzip2/xz-utils if bzcat/xzcat are missing
+  if ! req bzcat; then
+    install_package "bzip2" || {
+      log_error "Failed to install bzip2."
+      return 1
+    }
+  fi
+  if ! req xzcat; then
+    install_package "xz-utils" || {
+      log_error "Failed to install xz-utils."
+      return 1
+    }
+  fi
+
+  # Ensure curl or wget is available
+  if ! req curl; then
+    fakeCurlUsingWget || {
+      log_error "Failed to set up curl or wget."
+      return 1
+    }
+    if ! req curl && ! req wget; then
+      log_error "Missing both curl and wget, and unable to install/fake. Exiting."
+      return 1
+    fi
+  fi
+
+  # Try to set correct permissions on SSH host keys, ignore if fails (e.g., no keys)
+  chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null || true
+}
+
+infect() {
+  log_info "Beginning NixOS installation process."
+  setupNixBuildUsers
+  installNix
+  setupNixChannels
+  handleNixOSConfigDownload
+  buildNixOSSystemProfile
+  cleanupOldNixProfiles
+  reifyResolvConf
+  setRootFSLabel
+  prepareBootPartition
+  switchNixOSConfiguration
+}
+
+setupNixBuildUsers() {
+  log_info "Setting up Nix build users..."
+  groupadd nixbld -g 30000 || {
+    log_warning "groupadd failed, group may already exist"
+    true
+  }
+  for i in {1..10}; do
+    useradd -c "Nix build user $i" -d /var/empty -g nixbld -G nixbld -M -N -r -s "$(command -v nologin)" "nixbld$i" || {
+      log_warning "useradd for nixbld$i failed, user may already exist"
+      true
+    }
+  done
+}
+
+installNix() {
+  NIX_INSTALL_URL="${NIX_INSTALL_URL:-https://nixos.org/nix/install}"
+  log_info "Downloading Nix installer from $NIX_INSTALL_URL..."
+  if ! curl -L "$NIX_INSTALL_URL" | sh -s -- --no-channel-add; then
+    log_error "Failed to install Nix. Check network connectivity or URL."
+    exit 1
+  fi
+
+  # shellcheck source=/dev/null
+  if ! source ~/.nix-profile/etc/profile.d/nix.sh; then
+    log_error "Failed to source Nix profile."
+    exit 1
+  fi
+}
+
+setupNixChannels() {
+  [[ -z "$NIX_CHANNEL" ]] && NIX_CHANNEL="nixos-25.05"
+  log_info "Setting Nix channel to $NIX_CHANNEL..."
+  nix-channel --remove nixpkgs || true
+  nix-channel --add "https://nixos.org/channels/$NIX_CHANNEL" nixos || {
+    log_error "Failed to add Nix channel."
+    exit 1
+  }
+  nix-channel --update || {
+    log_error "Failed to update Nix channel."
+    exit 1
+  }
+}
+
+handleNixOSConfigDownload() {
+  if [[ $NIXOS_CONFIG = http* ]]; then
+    log_info "Downloading NixOS configuration from $NIXOS_CONFIG..."
+    if ! curl "$NIXOS_CONFIG" -o /etc/nixos/configuration.nix; then
+      log_error "Failed to download configuration from $NIXOS_CONFIG."
+      exit 1
+    fi
+    unset NIXOS_CONFIG # Unset to avoid issues with subsequent calls
+  fi
+  export NIXOS_CONFIG="${NIXOS_CONFIG:-/etc/nixos/configuration.nix}" # Ensure it's always set
+}
+
+buildNixOSSystemProfile() {
+  log_info "Building NixOS system profile..."
+  if ! nix-env --set \
+    -I "nixpkgs=$(realpath "$HOME"/.nix-defexpr/channels/nixos)" \
+    -f '<nixpkgs/nixos>' \
+    -p /nix/var/nix/profiles/system \
+    -A system; then
+    log_error "Failed to build NixOS system profile."
+    exit 1
+  fi
+}
+
+cleanupOldNixProfiles() {
+  log_info "Cleaning up old profiles..."
+  rm -fv /nix/var/nix/profiles/default* || true
+  /nix/var/nix/profiles/system/sw/bin/nix-collect-garbage || {
+    log_warning "Garbage collection failed."
+    true
+  }
+}
+
+reifyResolvConf() {
+  # Reify resolv.conf
+  if [[ -L /etc/resolv.conf ]]; then
+    log_info "Converting symbolic link /etc/resolv.conf to regular file..."
+    mv -v /etc/resolv.conf /etc/resolv.conf.lnk || {
+      log_warning "Failed to move /etc/resolv.conf symlink."
+      return 1
+    }
+    cat /etc/resolv.conf.lnk >/etc/resolv.conf || {
+      log_warning "Failed to reify /etc/resolv.conf."
+      return 1
+    }
+  fi
+}
+
+setRootFSLabel() {
+  if [ -n "$newrootfslabel" ]; then
+    log_info "Setting label of $rootfsdev to $newrootfslabel"
+    if ! command -v e2label >/dev/null 2>&1; then
+      log_warning "e2label not found, skipping filesystem label change."
+    elif ! e2label "$rootfsdev" "$newrootfslabel"; then
+      log_warning "Failed to set filesystem label to $newrootfslabel on $rootfsdev."
+    fi
+  fi
+
+  log_info "Setting up NixOS markers for lustration..."
+  touch /etc/NIXOS
+  {
+    echo etc/nixos
+    echo etc/resolv.conf
+    echo root/.nix-defexpr/channels
+    cd / && ls etc/ssh/ssh_host_*_key* || true
+  } >>/etc/NIXOS_LUSTRATE
+}
+
+prepareBootPartition() {
+  log_info "Backing up /boot directory..."
+  rm -rf /boot.bak
+  if isEFI; then
+    log_info "Unmounting EFI System Partition..."
+    if ! umount "$esp"; then
+      log_warning "Failed to unmount EFI partition at $esp."
+    fi
+  fi
+
+  mv -v /boot /boot.bak || {
+    log_warning "Failed to move /boot, attempting copy instead..."
+    cp -a /boot /boot.bak || {
+      log_error "Failed to backup /boot. Exiting."
+      exit 1
+    }
+    # Safely remove contents of /boot without deleting /boot itself
+    find /boot -mindepth 1 -delete || log_warning "Failed to clean /boot contents."
+    if mountpoint /boot; then
+      umount /boot || log_warning "Failed to unmount /boot."
+    fi
+  }
+  if isEFI; then
+    log_info "Setting up EFI boot directory..."
+    mkdir -p /boot || {
+      log_error "Failed to create /boot directory. Exiting."
+      exit 1
+    }
+    if ! mount "$esp" /boot; then
+      log_error "Failed to mount EFI partition at $esp to /boot. Exiting."
+      exit 1
+    fi
+    find /boot -depth ! -path /boot -exec rm -rf {} + || log_warning "Failed to clean /boot contents after remount."
+  fi
+}
+
+switchNixOSConfiguration() {
+  log_info "Switching to NixOS configuration..."
+  if ! /nix/var/nix/profiles/system/bin/switch-to-configuration boot; then
+    log_error "Failed to switch to NixOS configuration."
+    exit 1
+  fi
+}
+
+main() {
+  log_info "Starting NixOS infection process..."
+
+  # Determine the PROVIDER, either explicitly set or auto-detected
+  if [ -z "${PROVIDER+x}" ]; then # Check if PROVIDER is unset or null
+    log_info "PROVIDER environment variable not set. Attempting auto-detection..."
+    autodetectProvider
+    if [ -z "$PROVIDER" ]; then
+      log_info "No specific provider detected, falling back to generic configuration."
+      PROVIDER="generic"
+    else
+      log_info "Detected provider: $PROVIDER."
+    fi
+  else
+    log_info "Using specified PROVIDER: $PROVIDER."
+  fi
+
+  # Perform environment checks
+  log_info "Performing environment checks..."
+  if ! checkEnv; then
+    log_error "Environment check failed. Please resolve the reported issues and re-run the script."
+    exit 1
+  fi
+
+  # Prepare environment variables and mount points
+  log_info "Preparing environment..."
+  prepareEnv
+
+  # Check and manage swap space
+  log_info "Checking for existing swap..."
+  checkExistingSwap
+  if [[ -z "$NO_SWAP" ]]; then
+    log_info "Creating temporary swap file..."
+    if ! makeSwap; then
+      log_error "Failed to create and enable swap. Aborting installation."
+      exit 1
+    fi
+  else
+    log_info "Existing swap detected or NO_SWAP flag set. Skipping temporary swap creation."
+  fi
+
+  # Generate NixOS configuration files
+  log_info "Generating NixOS configuration for provider: $PROVIDER."
+  if ! makeConf; then
+    log_error "Failed to generate NixOS configuration files. Aborting installation."
+    exit 1
+  fi
+
+  # Proceed with NixOS installation
+  log_info "Beginning NixOS installation..."
+  if ! infect; then
+    log_error "NixOS installation failed. Please check logs for details."
+    exit 1
+  fi
+
+  # Provide root password information
+  if [[ -n "$rootPassword" ]]; then
+    echo
+    echo "========================================================================="
+    echo "  Your new root password for NixOS is:  $rootPassword"
+    echo "  Please store it securely."
+    echo "========================================================================="
+    echo
+  else
+    log_info "No root password was generated (openssl not found). SSH key authentication is recommended."
+  fi
+
+  # Clean up temporary swap
+  if [[ -z "$NO_SWAP" ]]; then
+    log_info "Removing temporary swap file..."
+    removeSwap
+  fi
+
+  # Handle system reboot
+  if [[ -z "$NO_REBOOT" ]]; then
+    log_info "Rebooting system into NixOS..."
+    reboot
+  else
+    log_info "Reboot skipped due to NO_REBOOT flag. Please reboot manually to complete installation."
+  fi
+}
+
+main
