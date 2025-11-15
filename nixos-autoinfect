@@ -194,6 +194,14 @@ generateHardwareConfig() {
   local kernel_modules_list="$2"
   local swap_config_content="$3"
 
+  # Use UUID if available, otherwise fall back to device path
+  local rootfs_spec
+  if [[ -n "$rootfsuuid" ]]; then
+    rootfs_spec="  fileSystems.\"/\".device = \"/dev/disk/by-uuid/$rootfsuuid\";"
+  else
+    rootfs_spec="  fileSystems.\"/\".device = \"$rootfsdev\";"
+  fi
+
   cat >/etc/nixos/hardware-configuration.nix <<EOF
 { modulesPath, ... }:
 {
@@ -203,7 +211,7 @@ ${boot_config_content}
   boot.initrd.availableKernelModules = [ ${kernel_modules_list} ];
   # Remove hardcoded nvme, relying on NixOS auto-detection
   # boot.initrd.kernelModules = [ "nvme" ];
-  fileSystems."/".device = "$rootfsdev";
+${rootfs_spec}
   fileSystems."/".fsType = "$rootfstype";
   ${swap_config_content}
 }
@@ -737,6 +745,19 @@ prepareEnv() {
     exit 1
   fi
   log_info "Identified root filesystem: device=$rootfsdev, type=$rootfstype."
+
+   # Get UUID for root filesystem (more reliable than device path)
+  rootfsuuid=""
+  if command -v blkid >/dev/null 2>&1; then
+    rootfsuuid="$(blkid -s UUID -o value "$rootfsdev" 2>/dev/null || true)"
+    if [[ -n "$rootfsuuid" ]]; then
+      log_info "Root filesystem UUID: $rootfsuuid"
+    else
+      log_warning "Failed to get UUID for $rootfsdev, will use device path"
+    fi
+  else
+    log_warning "blkid not found, will use device path instead of UUID"
+  fi
   
   # Determine the disk device from rootfsdev (e.g., /dev/sda1 -> /dev/sda)
   rootfsdisk="$(echo "$rootfsdev" | sed -E 's/([0-9]+)$//' | sed 's/p[0-9]*$//')"
