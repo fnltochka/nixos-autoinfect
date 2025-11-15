@@ -355,11 +355,8 @@ EOD
   if isEFI; then
     bootcfg_content=$(
       cat <<EOF
-  boot.loader.grub = {
-    efiSupport = true;
-    efiInstallAsRemovable = true;
-    device = "nodev";
-  };
+  boot.loader.systemd-boot.enable = true;
+  boot.loader.efi.canTouchEfiVariables = true;
   fileSystems."/boot" = { device = "$esp"; fsType = "vfat"; };
 EOF
     )
@@ -730,27 +727,8 @@ findESP() {
 
 prepareEnv() {
   log_info "Preparing environment variables and directories..."
-  # $esp and $grubdev are used in makeConf()
-  if isEFI; then
-    esp="$(findESP)" || {
-      log_error "Failed to determine EFI System Partition (ESP). Exiting."
-      exit 1
-    }
-  else
-    for grubdev_candidate in /dev/vda /dev/sda /dev/xvda /dev/nvme0n1; do
-      if [[ -e "$grubdev_candidate" ]]; then
-        grubdev="$grubdev_candidate"
-        log_info "Detected GRUB device: $grubdev."
-        break
-      fi
-    done
-    if [[ -z "$grubdev" ]]; then
-      log_error "Failed to detect a suitable GRUB device. Exiting."
-      exit 1
-    fi
-  fi
-
-  # Identify the root fs
+  
+  # Identify the root fs first (needed for device detection)
   rootfsdev="$(mount | grep "on / type" | awk '{print $1;}')"
   rootfstype="$(df "$rootfsdev" --output=fstype | sed 1d)"
   if [[ -z "$rootfsdev" || -z "$rootfstype" ]]; then
@@ -758,6 +736,41 @@ prepareEnv() {
     exit 1
   fi
   log_info "Identified root filesystem: device=$rootfsdev, type=$rootfstype."
+  
+  # Determine the disk device from rootfsdev (e.g., /dev/sda1 -> /dev/sda)
+  rootfsdisk="$(echo "$rootfsdev" | sed -E 's/([0-9]+)$//' | sed 's/p[0-9]*$//')"
+  
+  # $esp and $grubdev are used in makeConf()
+  if isEFI; then
+    esp="$(findESP)" || {
+      log_error "Failed to determine EFI System Partition (ESP). Exiting."
+      exit 1
+    }
+    # For EFI, also set grubdev to the disk device (may be useful)
+    if [[ -n "$rootfsdisk" && -e "$rootfsdisk" ]]; then
+      grubdev="$rootfsdisk"
+      log_info "Detected disk device for EFI system: $grubdev."
+    fi
+  else
+    # For non-EFI, use the disk device from root filesystem
+    if [[ -n "$rootfsdisk" && -e "$rootfsdisk" ]]; then
+      grubdev="$rootfsdisk"
+      log_info "Detected GRUB device from root filesystem: $grubdev."
+    else
+      # Fallback to candidate list if we can't determine from rootfs
+      for grubdev_candidate in /dev/vda /dev/sda /dev/xvda /dev/nvme0n1; do
+        if [[ -e "$grubdev_candidate" ]]; then
+          grubdev="$grubdev_candidate"
+          log_info "Detected GRUB device (fallback): $grubdev."
+          break
+        fi
+      done
+    fi
+    if [[ -z "$grubdev" ]]; then
+      log_error "Failed to detect a suitable GRUB device. Exiting."
+      exit 1
+    fi
+  fi
 
   export USER="root"
   export HOME="/root"
@@ -1009,10 +1022,28 @@ setRootFSLabel() {
 prepareBootPartition() {
   log_info "Backing up /boot directory..."
   rm -rf /boot.bak
+  
   if isEFI; then
-    log_info "Unmounting EFI System Partition..."
-    if ! umount "$esp"; then
-      log_warning "Failed to unmount EFI partition at $esp."
+    # For EFI systems, unmount /boot/efi first if it exists
+    if mountpoint -q /boot/efi 2>/dev/null; then
+      log_info "Unmounting /boot/efi..."
+      umount /boot/efi || log_warning "Failed to unmount /boot/efi."
+    fi
+    # Then unmount /boot if it's a mountpoint
+    if mountpoint -q /boot 2>/dev/null; then
+      log_info "Unmounting /boot..."
+      umount /boot || log_warning "Failed to unmount /boot."
+    fi
+    # Also try to unmount ESP directly if it's mounted elsewhere
+    if [[ -n "$esp" ]]; then
+      local esp_device
+      esp_device="$(readlink -f "$esp" 2>/dev/null || echo "$esp")"
+      local esp_mountpoint
+      esp_mountpoint="$(mount | grep "$esp_device" | awk '{print $3}')"
+      if [[ -n "$esp_mountpoint" && "$esp_mountpoint" != "/boot" && "$esp_mountpoint" != "/boot/efi" ]]; then
+        log_info "Unmounting ESP from $esp_mountpoint..."
+        umount "$esp_mountpoint" || log_warning "Failed to unmount ESP from $esp_mountpoint."
+      fi
     fi
   fi
 
@@ -1023,11 +1054,23 @@ prepareBootPartition() {
       exit 1
     }
     # Safely remove contents of /boot without deleting /boot itself
-    find /boot -mindepth 1 -delete || log_warning "Failed to clean /boot contents."
-    if mountpoint /boot; then
+    # First try to unmount any remaining mounts
+    if mountpoint -q /boot/efi 2>/dev/null; then
+      umount /boot/efi || log_warning "Failed to unmount /boot/efi."
+    fi
+    if mountpoint -q /boot 2>/dev/null; then
       umount /boot || log_warning "Failed to unmount /boot."
     fi
+    # Use lsof to find processes using /boot and wait a bit
+    if command -v lsof >/dev/null 2>&1; then
+      if lsof +D /boot 2>/dev/null | grep -q .; then
+        log_info "Waiting for processes to release /boot..."
+        sleep 2
+      fi
+    fi
+    find /boot -mindepth 1 -delete 2>/dev/null || log_warning "Failed to clean /boot contents."
   }
+  
   if isEFI; then
     log_info "Setting up EFI boot directory..."
     mkdir -p /boot || {
@@ -1038,7 +1081,7 @@ prepareBootPartition() {
       log_error "Failed to mount EFI partition at $esp to /boot. Exiting."
       exit 1
     fi
-    find /boot -depth ! -path /boot -exec rm -rf {} + || log_warning "Failed to clean /boot contents after remount."
+    find /boot -depth ! -path /boot -exec rm -rf {} + 2>/dev/null || log_warning "Failed to clean /boot contents after remount."
   fi
 }
 
