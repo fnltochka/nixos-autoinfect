@@ -213,7 +213,8 @@ EOF
 makeConf() {
   # Skip generation only if BOTH config and hardware files exist
   if [ -e /etc/nixos/configuration.nix ] && [ -e /etc/nixos/hardware-configuration.nix ]; then
-    log_info "Existing configuration files found, skipping generation."
+    log_warning "Existing configuration files found. They will be used as-is."
+    log_warning "If you need to regenerate configuration, delete /etc/nixos/configuration.nix and /etc/nixos/hardware-configuration.nix first."
     return 0
   fi
 
@@ -366,10 +367,10 @@ EOF
   boot.loader.grub.device = "$grubdev";
 EOF
     )
-  fi
-
-  if [[ -n "$grub_device_override_config" ]]; then
-    bootcfg_content="$grub_device_override_config"
+    # Apply grub_device_override_config only for non-EFI systems
+    if [[ -n "$grub_device_override_config" ]]; then
+      bootcfg_content="$grub_device_override_config"
+    fi
   fi
 
   # These modules are universal enough for many VMs and some physical machines
