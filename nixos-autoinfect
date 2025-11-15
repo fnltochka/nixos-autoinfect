@@ -381,8 +381,17 @@ EOF
     fi
   fi
 
-  # These modules are universal enough for many VMs and some physical machines
-  local availableKernelModules=('"ata_piix"' '"uhci_hcd"' '"xen_blkfront"')
+  # These modules are universal enough for many VMs and some physical machines.
+  # Include common SATA/USB storage controllers and popular virtualization drivers
+  # so that the initrd can see the root disk even if the device name changes.
+  local availableKernelModules=(
+    '"ata_piix"'
+    '"uhci_hcd"'
+    '"xen_blkfront"'
+    '"virtio_pci"'
+    '"virtio_blk"'
+    '"virtio_scsi"'
+  )
   if isX86_64; then
     availableKernelModules+=('"vmw_pvscsi"')
   fi
