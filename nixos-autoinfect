@@ -320,7 +320,8 @@ EOD
     while read -r line; do
       line=$(echo -n "$line" | sed 's/\r//g')
       trimmed_line=$(echo -n "$line" | xargs)
-      ssh_keys_content+="'$trimmed_line' "
+      escaped_line=$(printf '%s' "$trimmed_line" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')
+      ssh_keys_content+="\"$escaped_line\" "
     done <<<"$keys"
   fi
 
